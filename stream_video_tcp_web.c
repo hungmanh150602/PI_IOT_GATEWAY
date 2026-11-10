@@ -348,7 +348,7 @@ static void send_http_page(int clientfd)
         "  <style>\n"
         "    body { margin:0; padding:24px; background:#171717; color:#eee;"
         " font:16px Arial,sans-serif; text-align:center; }\n"
-        "    img { display:block; width:100%; max-width:960px; height:auto;"
+        "    img { display:block; width:100%; max-width:640px; height:auto;"
         " margin:20px auto; background:#000; }\n"
         "  </style>\n"
         "</head>\n"
