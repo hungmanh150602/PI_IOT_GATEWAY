@@ -189,7 +189,7 @@ int main(int argc, char *argv[])
     {
         fprintf(stderr,
                 "Usage: %s <host> <port> <path> <output_path>\n"
-                "Example: ./build/http_client 192.168.1.100 80 /capture images/capture.jpg\n",
+                "Example: ./build/http_capture_tcp 192.168.1.100 80 /capture images/capture.jpg\n",
                 argv[0]);
         return EXIT_FAILURE;
     }

@@ -10,6 +10,9 @@
 #include <errno.h>
 #include <limits.h>
 
+#include <dirent.h>
+#include <sys/stat.h>
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -157,17 +160,28 @@ static int parse_content_length(const char *line, size_t *length)
     return 0;
 }
 
+/* Thiết lập kết nối TCP
+ * Nếu thành công, hàm trả về socket file descriptor.
+ * Nếu thất bại, trả về -1.
+ */
 static int connect_to_server(const char *host, const char *port)
 {
+    /* Các biến này phục vụ DNS resolution và duyệt các địa chỉ IP
+     * mà getaddrinfo() trả về.
+     */
     struct addrinfo hints;
     struct addrinfo *result = NULL;
     struct addrinfo *rp;
     int sockfd = -1;
 
+    /* set all to 0 */
     memset(&hints, 0, sizeof(hints));
+    /* cho phép sử dụng IPv4 hoặc IPv6. */
     hints.ai_family = AF_UNSPEC;
+    /* TCP */
     hints.ai_socktype = SOCK_STREAM;
 
+    /* Resolve hostname */
     int ret = getaddrinfo(host, port, &hints, &result);
 
     if (ret != 0)
@@ -176,15 +190,16 @@ static int connect_to_server(const char *host, const char *port)
         return -1;
     }
 
+    /* Create TCP connection */
     for (rp = result; rp != NULL; rp = rp->ai_next)
     {
-        sockfd = socket(rp->ai_family, rp->ai_socktype,
-                        rp->ai_protocol);
+        sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 
         if (sockfd < 0)
             continue;
 
         if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) == 0)
+            /* nếu kết nối thành công thì thoát */
             break;
 
         close(sockfd);
@@ -195,12 +210,83 @@ static int connect_to_server(const char *host, const char *port)
     return sockfd;
 }
 
+/*
+ * Delete old frame files from the output directory.
+ * Only regular files whose names start with "frame_" are deleted.
+ */
+static int cleanup_frame_files(const char *output_dir)
+{
+    DIR *dir = opendir(output_dir);
+
+    if (dir == NULL)
+    {
+        perror("opendir");
+        return -1;
+    }
+
+    struct dirent *entry;
+    char filepath[PATH_MAX];
+    unsigned int deleted_count = 0;
+
+    while ((entry = readdir(dir)) != NULL)
+    {
+
+        /* Only process files starting with "frame_". */
+        if (strncmp(entry->d_name, "frame_", 6) != 0)
+            continue;
+
+        int len = snprintf(filepath, sizeof(filepath), "%s/%s",
+                           output_dir, entry->d_name);
+
+        if (len < 0 || (size_t)len >= sizeof(filepath))
+        {
+            fprintf(stderr, "Path too long: %s\n", entry->d_name);
+            continue;
+        }
+
+        struct stat st;
+
+        if (lstat(filepath, &st) != 0)
+        {
+            perror("lstat");
+            continue;
+        }
+
+        /* Do not delete directories or symbolic links. */
+        if (!S_ISREG(st.st_mode))
+            continue;
+
+        if (unlink(filepath) == 0)
+        {
+            deleted_count++;
+            // printf("Deleted: %s\n", filepath);
+        }
+        else
+        {
+            perror("unlink");
+        }
+    }
+
+    closedir(dir);
+
+    printf("Cleanup completed: %u old frame file(s) deleted\n", deleted_count);
+
+    return 0;
+}
+
+/* Tham số	        Ý nghĩa	                            Ví dụ
+ * argv[0]	    Tên chương trình	                ./mjpeg_client
+ * argv[1]	    IP hoặc hostname của ESP32-CAM	    192.168.1.100
+ * argv[2]	    TCP port	                        81
+ * argv[3]	    Thư mục lưu ảnh	                    /mnt/usb/frames
+ */
 int main(int argc, char *argv[])
 {
     if (argc != 4)
     {
         fprintf(stderr,
-                "Usage: %s <host> <port> <output_directory>\n",
+                "Usage: %s <host> <port> <output_directory>\n"
+                "Example: ./build/mjpeg_client_tcp 192.168.1.100 81 images\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -209,8 +295,19 @@ int main(int argc, char *argv[])
     const char *port = argv[2];
     const char *output_dir = argv[3];
 
+    /* Remove old frame files before starting. */
+    printf("Cleaning old frame files...\n");
+
+    if (cleanup_frame_files(output_dir) != 0)
+    {
+        fprintf(stderr, "Failed to clean output directory\n");
+        return EXIT_FAILURE;
+    }
+
+    /* Đăng ký xử lý tín hiệu SIGINT */
     signal(SIGINT, handle_sigint);
 
+    /* Thiết lập kết nối TCP */
     int sockfd = connect_to_server(host, port);
 
     if (sockfd < 0)
@@ -221,16 +318,21 @@ int main(int argc, char *argv[])
 
     printf("TCP connection established\n");
 
+    /* Tạo HTTP GET request:
+     * GET /stream HTTP/1.1
+     * Host: 192.168.1.100
+     * Accept: multipart/x-mixed-replace
+     * Connection: keep-alive
+     */
     char request[1024];
 
-    int request_len = snprintf(
-        request, sizeof(request),
-        "GET /stream HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Accept: multipart/x-mixed-replace\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n",
-        host);
+    int request_len = snprintf(request, sizeof(request),
+                               "GET /stream HTTP/1.1\r\n"
+                               "Host: %s\r\n"
+                               "Accept: multipart/x-mixed-replace\r\n"
+                               "Connection: keep-alive\r\n"
+                               "\r\n",
+                               host);
 
     if (request_len < 0 || (size_t)request_len >= sizeof(request))
     {
@@ -239,6 +341,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    /* gửi toàn bộ request qua TCP socket. */
     if (send_all(sockfd, request, (size_t)request_len) != 0)
     {
         perror("send_all");
@@ -248,13 +351,14 @@ int main(int argc, char *argv[])
 
     printf("HTTP GET request sent\n");
 
-    /* Step 1: Read HTTP response headers. */
+    /* Read HTTP response headers. */
     char line[LINE_SIZE];
     int status_code = 0;
     int have_content_type = 0;
 
     while (running)
     {
+        /* Client bắt đầu đọc HTTP response headers bằng read_line(). */
         int len = read_line(sockfd, line, sizeof(line));
 
         if (len < 0)
@@ -267,6 +371,11 @@ int main(int argc, char *argv[])
         if (len == 0)
             break;
 
+        /* Ví dụ server trả về:
+         * HTTP/1.1 200 OK
+         * Content-Type: multipart/x-mixed-replace; boundary=frame
+         * Connection: keep-alive
+         */
         if (strncmp(line, "HTTP/", 5) == 0)
         {
             if (sscanf(line, "%*s %d", &status_code) != 1)
@@ -297,7 +406,7 @@ int main(int argc, char *argv[])
 
     printf("MJPEG multipart response accepted\n");
 
-    /* Step 2: Receive multipart frames. */
+    /* Receive multipart frames. */
     unsigned int frame_count = 0;
 
     while (running)
@@ -357,10 +466,9 @@ int main(int argc, char *argv[])
 
         char filename[PATH_MAX];
 
-        int name_len = snprintf(
-            filename, sizeof(filename),
-            "%s/frame_%06u.jpg",
-            output_dir, frame_count + 1);
+        int name_len = snprintf(filename, sizeof(filename),
+                                "%s/frame_%06u.jpg",
+                                output_dir, frame_count + 1);
 
         if (name_len < 0 || (size_t)name_len >= sizeof(filename))
         {
