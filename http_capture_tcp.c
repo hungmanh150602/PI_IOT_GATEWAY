@@ -1,3 +1,10 @@
+/*
+ * Download an HTTP response body over TCP and save it to a local file.
+ * The program resolves the server address, sends a GET request, separates
+ * the response headers from the body, and writes only body bytes to disk.
+ */
+
+/* Standard C and POSIX headers for I/O, strings, sockets, and error handling. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,9 +16,15 @@
 #include <sys/socket.h>
 #include <netdb.h>
 
+/* Network read buffer and maximum accumulated response-header size. */
 #define BUFFER_SIZE 4096
 #define HEADER_SIZE 16384
 
+/*
+ * Metadata extracted from the HTTP response headers.
+ * has_content_length distinguishes a missing length header from a valid
+ * Content-Length value of zero; content_type is a bounded display buffer.
+ */
 struct http_response
 {
     int status_code;
@@ -20,6 +33,11 @@ struct http_response
     char content_type[128];
 };
 
+/*
+ * Send the complete request even when send() performs a partial write.
+ * Retry when interrupted by a signal; report other socket errors and return
+ * -1 if the peer closes the connection before all bytes are sent.
+ */
 static int send_all(int sockfd, const char *data, size_t len)
 {
     size_t total = 0;
@@ -46,7 +64,11 @@ static int send_all(int sockfd, const char *data, size_t len)
     return 0;
 }
 
-/* Find CRLF CRLF in HTTP header */
+/*
+ * Find the end of the HTTP header block, marked by CRLF CRLF.
+ * Return the offset immediately after the delimiter, or -1 if it is not
+ * present in the len bytes currently available.
+ */
 static int find_header_end(const char *buffer, size_t len)
 {
     if (len < 4)
@@ -54,35 +76,27 @@ static int find_header_end(const char *buffer, size_t len)
 
     for (size_t i = 0; i <= len - 4; i++)
     {
-        /* so sánh 4 byte liên tiếp kể từ vị trí buffer + i xem có khớp
-         * hoàn toàn với chuỗi "\r\n\r\n" hay không.
-         */
+        /* Compare four bytes at this position with the header terminator. */
         if (memcmp(buffer + i, "\r\n\r\n", 4) == 0)
             return (int)(i + 4);
     }
     return -1;
 }
 
-/* Parse HTTP response headers
- * Hàm parse_headers trong C dùng để phân tích cú pháp (parse)
- * chuỗi HTTP response header vừa nhận được,
- * nhằm trích xuất các thông tin quan trọng như:
- *
- * 1. Mã trạng thái HTTP (Status Code) (ví dụ: 200, 404, 500).
- * 2. Độ dài nội dung (Content-Length).
- * 3. Loại nội dung (Content-Type).
+/*
+ * Parse the complete HTTP response header block and extract the status code,
+ * optional Content-Length, and optional Content-Type. The input is modified
+ * in place by strtok_r() as it splits the block into lines.
  */
 static int parse_headers(char *header, struct http_response *response)
 {
-    /* Đặt toàn bộ các trường dữ liệu bên trong biến response
-     * về giá trị 0 để tránh rác bộ nhớ từ các giá trị cũ.
-     */
+    /* Initialize every field so absent headers have well-defined defaults. */
     memset(response, 0, sizeof(*response));
 
-    /* Xử lý dòng đầu tiên (Status Line)
-     * strtok_r: Hàm cắt chuỗi an toàn theo luồng (thread-safe) dùng để tách từng dòng
-     * dựa vào ký tự xuống dòng \r\n. Dòng đầu tiên (line) luôn là Status Line
-     * (ví dụ: HTTP/1.1 200 OK).
+    /*
+     * Split the mutable header block into lines. The first line is the HTTP
+     * status line (for example, "HTTP/1.1 200 OK"); saveptr preserves the
+     * tokenizer state between calls.
      */
     char *saveptr = NULL;
     char *line = strtok_r(header, "\r\n", &saveptr);
@@ -93,40 +107,29 @@ static int parse_headers(char *header, struct http_response *response)
         return -1;
     }
 
-    /* Duyệt qua các dòng header tiếp theo bằng vòng lặp while
-     * Vòng lặp tiếp tục cắt từng dòng tiếp theo của header cho đến khi hết chuỗi (NULL)
-     */
+    /* Process each remaining header line until the block has been consumed. */
     while ((line = strtok_r(NULL, "\r\n", &saveptr)) != NULL)
     {
-        /* Xử lý header Content-Length
-         * strncasecmp: So sánh 15 ký tự đầu tiên của dòng với chuỗi "Content-Length:"
-         * mà không phân biệt chữ hoa/chữ thường.
-         */
+        /* HTTP field names are case-insensitive, so compare without case. */
         if (strncasecmp(line, "Content-Length:", 15) == 0)
         {
             char *value = line + 15;
             char *endptr = NULL;
 
-            /* Bỏ qua khoảng trắng hoặc tab thừa
-             * Dịch con trỏ value qua phải nếu có dấu cách ( ) hoặc
-             * tab (\t) dư thừa sau dấu hai chấm.
-             */
+            /* Ignore optional whitespace between the colon and the value. */
             while (*value == ' ' || *value == '\t')
                 value++;
 
             errno = 0;
-            /* strtoull: Chuyển đổi chuỗi số thành dạng số nguyên lớn không âm
-             * (unsigned long long).
-             */
+            /* Parse the decimal length while detecting conversion errors. */
             unsigned long long length = strtoull(value, &endptr, 10);
 
-            /* Kiểm tra lỗi ép kiểu số nguyên an toàn
-             * Đảm bảo chuỗi không chứa ký tự lạ, không bị tràn số (length > SIZE_MAX),
-             * nếu sai sót sẽ trả về -1.
-             * Nếu đúng, lưu giá trị vào response->content_length
-             * và đánh dấu response->has_content_length = 1.
+            /*
+             * Reject conversion errors, empty values, trailing characters,
+             * and values that cannot fit in size_t before storing the length.
              */
-            if (errno != 0 || endptr == value || *endptr != '\0' || length > SIZE_MAX)
+            if (errno != 0 || endptr == value || *endptr != '\0' ||
+                length > SIZE_MAX)
             {
                 fprintf(stderr, "Invalid Content-Length\n");
                 return -1;
@@ -136,21 +139,16 @@ static int parse_headers(char *header, struct http_response *response)
             response->has_content_length = 1;
         }
 
-        /* Tương tự như Content-Length
-         * hàm tìm kiếm dòng bắt đầu bằng "Content-Type:" (không phân biệt hoa thường).
-         */
+        /* Capture Content-Type for reporting; it is not used to decode the body. */
         else if (strncasecmp(line, "Content-Type:", 13) == 0)
         {
             const char *value = line + 13;
 
-            /* Bỏ qua khoảng trắng thừa sau dấu hai chấm. */
+            /* Ignore optional whitespace after the field-name colon. */
             while (*value == ' ' || *value == '\t')
                 value++;
 
-            /* snprintf: Sao chép an toàn chuỗi giá trị
-             * (ví dụ: application/json hoặc text/html) vào bộ đệm response->content_type
-             * nhằm tránh lỗi tràn bộ đệm (buffer overflow).
-             */
+            /* Bound the copy so an unusually long field cannot overflow the buffer. */
             snprintf(response->content_type, sizeof(response->content_type), "%s", value);
         }
     }
@@ -158,19 +156,15 @@ static int parse_headers(char *header, struct http_response *response)
 }
 
 /*
- * Hàm "save_body" trong C dùng để ghi phần thân (body) của phản hồi HTTP
- * (dữ liệu tải về như tệp tin, hình ảnh, HTML,...) vào một tệp (file) đang mở,
- * đồng thời cộng dồn tổng số byte đã ghi vào biến đếm (total).
+ * Write len response-body bytes to the already-open output file and add the
+ * successfully written count to total. A zero-length chunk is a no-op.
  */
 static int save_body(FILE *file, const char *data, size_t len, size_t *total)
 {
     if (len == 0)
         return 0;
 
-    /* fwrite thực hiện ghi len phần tử (mỗi phần tử kích thước 1 byte)
-     * từ bộ đệm data vào luồng tệp file.
-     * Giá trị trả về (written) là số byte thực tế đã được ghi thành công.
-     */
+    /* Write bytes verbatim; using one-byte elements preserves binary payloads. */
     size_t written = fwrite(data, 1, len, file);
 
     if (written != len)
@@ -185,6 +179,7 @@ static int save_body(FILE *file, const char *data, size_t len, size_t *total)
 
 int main(int argc, char *argv[])
 {
+    /* Require the server host, TCP port, request path, and output file path. */
     if (argc != 5)
     {
         fprintf(stderr,
@@ -194,6 +189,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    /* Keep command-line values as read-only strings for request construction. */
     const char *host = argv[1];
     const char *port = argv[2];
     const char *path = argv[3];
@@ -202,7 +198,7 @@ int main(int argc, char *argv[])
     int sockfd = -1;
     int ret = EXIT_FAILURE;
 
-    /* Các biến này phục vụ DNS resolution và duyệt các địa chỉ IP mà getaddrinfo() trả về. */
+    /* Address-resolution structures used to try each candidate server address. */
     struct addrinfo hints;
     struct addrinfo *result = NULL;
     struct addrinfo *rp = NULL;
@@ -210,30 +206,29 @@ int main(int argc, char *argv[])
     FILE *file = NULL;
 
     /*
-    Ba buffer có ba nhiệm vụ khác nhau:
-        Buffer	             Chức năng
-    request	        Chứa HTTP GET request
-    buffer	        Nhận dữ liệu TCP
-    header	        Tích lũy HTTP Header
-    */
+     * The buffers have distinct roles:
+     * request holds the outgoing GET request,
+     * buffer receives raw TCP data, and
+     * header accumulates response bytes until the header terminator is found.
+     */
     char request[1024];
-    /* Nhận dữ liệu TCP */
+    /* Temporary storage for each chunk received from the TCP socket. */
     char buffer[BUFFER_SIZE];
-    /* Tích lũy HTTP Header */
+    /* Accumulated response headers, bounded by HEADER_SIZE. */
     char header[HEADER_SIZE];
 
-    size_t header_len = 0;    /* số byte Header đã tích lũy. */
-    size_t body_received = 0; /* số byte Body đã ghi. */
+    size_t header_len = 0;    /* Number of response-header bytes accumulated so far. */
+    size_t body_received = 0; /* Number of response-body bytes written to the file. */
 
-    int header_complete = 0; /* đánh dấu đã tìm được \r\n\r\n. */
+    int header_complete = 0; /* Set once the CRLF CRLF header terminator is found. */
 
     struct http_response response = {0};
 
-    /* 1. Resolve hostname */
-    memset(&hints, 0, sizeof(hints)); /* set all to 0 */
+    /* 1. Resolve the host and port into one or more usable network addresses. */
+    memset(&hints, 0, sizeof(hints)); /* Clear optional addrinfo settings. */
 
-    hints.ai_family = AF_UNSPEC;     /* cho phép sử dụng IPv4 hoặc IPv6. */
-    hints.ai_socktype = SOCK_STREAM; /* TCP */
+    hints.ai_family = AF_UNSPEC;     /* Permit either IPv4 or IPv6 results. */
+    hints.ai_socktype = SOCK_STREAM; /* Request a stream socket (TCP). */
 
     int status = getaddrinfo(host, port, &hints, &result);
 
@@ -243,7 +238,7 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
-    /* 2. Create TCP connection */
+    /* 2. Try each resolved address until a TCP connection succeeds. */
     for (rp = result; rp != NULL; rp = rp->ai_next)
     {
         sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
@@ -253,11 +248,11 @@ int main(int argc, char *argv[])
 
         if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) == 0)
         {
-            /* nếu kết nối thành công thì thoát */
+            /* Keep this connected socket and stop searching the address list. */
             break;
         }
 
-        /* nếu kết nối thất bại thì thử địa chỉ tiếp theo */
+        /* Discard the failed socket before trying the next resolved address. */
         close(sockfd);
         sockfd = -1;
     }
@@ -270,12 +265,11 @@ int main(int argc, char *argv[])
 
     printf("TCP connection established\n");
 
-    /* 3. Construct HTTP GET request
-    ví dụ:
-    GET /stream HTTP/1.1
-    Host: 192.168.1.100
-    Connection: close
-    */
+    /*
+     * 3. Construct an HTTP/1.1 GET request. Connection: close asks the server
+     * to close the connection after sending the response, which also allows
+     * the client to detect completion when Content-Length is absent.
+     */
     int request_len = snprintf(request, sizeof(request),
                                "GET %s HTTP/1.1\r\n"
                                "Host: %s\r\n"
@@ -289,19 +283,16 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
-    /* 4. Send request
-    bảo đảm gửi hết request.
-    */
+    /* 4. Send the entire request, handling partial writes in send_all(). */
     if (send_all(sockfd, request, (size_t)request_len) < 0)
         goto cleanup;
 
     printf("HTTP GET request sent\n");
 
-    /* 5. Open output file
-    Chế độ "wb" có nghĩa:
-    - w: mở để ghi, tạo file nếu chưa có hoặc xóa nội dung cũ nếu đã tồn tại.
-    - b: chế độ binary.
-    */
+    /*
+     * 5. Open the destination in binary-write mode. This creates a new file
+     * or truncates an existing one, and avoids text-mode transformations.
+     */
     file = fopen(output, "wb");
 
     if (file == NULL)
@@ -310,10 +301,10 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
-    /* 6. Receive and parse HTTP response */
+    /* 6. Receive the response, separating its headers from its body. */
     while (1)
     {
-        /* nhận phản hồi */
+        /* Read the next available chunk from the server. */
         ssize_t received = recv(sockfd, buffer, sizeof(buffer), 0);
 
         if (received < 0)
@@ -331,7 +322,7 @@ int main(int argc, char *argv[])
         size_t offset = 0;
         size_t chunk_len = (size_t)received;
 
-        /* 6.1. Receive HTTP headers */
+        /* 6.1. Accumulate header bytes until the CRLF CRLF delimiter is found. */
         if (!header_complete)
         {
             while (offset < chunk_len && !header_complete)
@@ -344,10 +335,10 @@ int main(int argc, char *argv[])
 
                 header[header_len++] = buffer[offset++];
 
-                /* tìm kiếm kết thúc HTTP header */
+                /* Check whether the accumulated bytes now contain the delimiter. */
                 int end = find_header_end(header, header_len);
 
-                /* tìm thấy */
+                /* The complete header is available; parse it before body data. */
                 if (end >= 0)
                 {
                     header_complete = 1;
@@ -377,34 +368,34 @@ int main(int argc, char *argv[])
             }
         }
 
-        /* 6.2. Save HTTP body
-         * HTTP Header đã hoàn tất.
-         * Trong buffer hiện tại vẫn còn dữ liệu chưa xử lý.
-         * Phần dữ liệu còn lại chính là HTTP Body:
+        /*
+         * 6.2. Save body bytes from the current TCP chunk.
+         * offset points just past the header delimiter, so any remaining
+         * bytes in this same chunk belong to the response body.
          */
         if (header_complete && offset < chunk_len)
         {
             size_t body_len = chunk_len - offset;
 
-            /* Nếu có Content-Length */
+            /* If the server declared a body length, do not write beyond it. */
             if (response.has_content_length)
             {
-                /* Tính số byte còn phải nhận. */
+                /* Calculate how many more bytes are expected. */
                 size_t remaining = response.content_length - body_received;
 
-                /* Không ghi vượt quá Content-Length. */
+                /* Ignore any bytes beyond the declared response-body length. */
                 if (body_len > remaining)
                     body_len = remaining;
             }
 
-            /* Chỉ ghi phần Body, không ghi Header. */
+            /* Write only the body portion; the HTTP headers are never saved. */
             if (save_body(file, buffer + offset, body_len, &body_received) < 0)
             {
                 goto cleanup;
             }
         }
 
-        /* Nếu đã nhận đủ số byte theo Content-Length thì kết thúc vòng lặp. */
+        /* Stop as soon as the declared number of body bytes has been received. */
         if (header_complete &&
             response.has_content_length &&
             body_received == response.content_length)
@@ -413,7 +404,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* kiểm tra Header và Body có hoàn chỉnh hay không. */
+    /* Verify that the response header and, when declared, the body are complete. */
     if (!header_complete)
     {
         fprintf(stderr, "Incomplete HTTP response header\n");
@@ -436,7 +427,7 @@ int main(int argc, char *argv[])
               ? EXIT_SUCCESS
               : EXIT_FAILURE;
 
-/* Giải phóng tài nguyên */
+/* Release any resources acquired along the success or error paths. */
 cleanup:
 
     if (file != NULL)

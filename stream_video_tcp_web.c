@@ -1,17 +1,16 @@
-/*      Chức năng	                            Trạng thái
+/*
+ * Program workflow overview:
+ * 1. Connect to the ESP32-CAM over TCP and request the HTTP /stream endpoint.
+ * 2. Validate the HTTP status code and multipart MJPEG content type.
+ * 3. Start a local HTTP server that browsers can access through this gateway.
+ * 4. Serve an HTML page at "/" and forward JPEG frames at "/stream".
+ * 5. Frames are held in memory only while being forwarded; they are not saved to disk.
+ */
 
-Kết nối TCP đến ESP32-CAM	                    Giữ nguyên
-Gửi HTTP GET /stream	                        Giữ nguyên
-Phân tích HTTP multipart	                    Giữ nguyên
-Nhận JPEG frame	                                Giữ nguyên
-Lưu frame vào images	                        Đã loại bỏ
-Tạo HTTP server trên Raspberry Pi	                Mới
-Chuyển tiếp MJPEG đến Chrome	                    Mới
-Hiển thị trang web chứa video	                    Mới
-*/
-
+/* Enable GNU extensions, including helpers such as strcasestr(). */
 #define _GNU_SOURCE
 
+/* Standard C functions for I/O, memory allocation, and string handling. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -28,21 +27,32 @@ Hiển thị trang web chứa video	                    Mới
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
+/* Buffer sizes and limits for data received over the network. */
 #define BUFFER_SIZE 4096
 #define LINE_SIZE 1024
 #define REQUEST_SIZE 4096
 #define MAX_FRAME_SIZE (10U * 1024U * 1024U)
 #define DEFAULT_WEB_PORT "8080"
 
+/*
+ * Flag shared by the main loop and the signal handler.
+ * sig_atomic_t allows simple reads and writes to be handled atomically
+ * when accessed from a signal handler.
+ */
 static volatile sig_atomic_t running = 1;
 
+/* Ask the loops to stop cleanly when Ctrl+C or SIGTERM is received. */
 static void handle_sigint(int signo)
 {
     (void)signo;
     running = 0;
 }
 
-/* Send all bytes unless the peer disconnects or an unrecoverable error occurs. */
+/*
+ * Send all length bytes because send() may transmit only part of the data.
+ * Resume from the last transmitted byte after EINTR; return -1 if the socket
+ * fails or closes, or if the program stops before the send is complete.
+ */
 static int send_all(int sockfd, const void *data, size_t length)
 {
     const unsigned char *p = data;
@@ -68,7 +78,12 @@ static int send_all(int sockfd, const void *data, size_t length)
     return total == length ? 0 : -1;
 }
 
-/* Read one CRLF-terminated line. The returned string excludes CRLF. */
+/*
+ * Read one protocol line, one byte at a time, until a newline is encountered.
+ * Strip the CR preceding LF and always null-terminate the resulting string.
+ * Return the line length, or -1 if the connection closes, an error occurs,
+ * or the line exceeds the buffer capacity.
+ */
 static int read_line(int sockfd, char *buffer, size_t capacity)
 {
     size_t pos = 0;
@@ -107,7 +122,11 @@ static int read_line(int sockfd, char *buffer, size_t capacity)
     return -1;
 }
 
-/* Read exactly length bytes from a socket into memory. */
+/*
+ * Read exactly length bytes, typically for a JPEG payload whose size is
+ * specified by its Content-Length header. A single recv() may not return
+ * all requested data because TCP can deliver it in multiple segments.
+ */
 static int recv_exact(int sockfd, unsigned char *buffer, size_t length)
 {
     size_t total = 0;
@@ -132,6 +151,11 @@ static int recv_exact(int sockfd, unsigned char *buffer, size_t length)
     return total == length ? 0 : -1;
 }
 
+/*
+ * Parse the numeric value after the colon in a Content-Length header.
+ * Reject empty, zero, malformed, or oversized values to avoid invalid or
+ * excessive frame-memory allocations.
+ */
 static int parse_content_length(const char *line, size_t *length)
 {
     const char *colon = strchr(line, ':');
@@ -157,6 +181,11 @@ static int parse_content_length(const char *line, size_t *length)
     return 0;
 }
 
+/*
+ * Resolve addresses for the host and port, then try each one in turn.
+ * This supports both IPv4 and IPv6. Return the first successfully connected
+ * socket, or -1 if none of the available addresses can be reached.
+ */
 static int connect_to_server(const char *host, const char *port)
 {
     struct addrinfo hints;
@@ -192,7 +221,12 @@ static int connect_to_server(const char *host, const char *port)
     return sockfd;
 }
 
-/* Connect to the ESP32-CAM and validate its HTTP MJPEG response. */
+/*
+ * Connect to the ESP32-CAM, request GET /stream, and read the response headers.
+ * Proceed only if the server returns HTTP 200 and a Content-Type identifying
+ * the multipart/x-mixed-replace stream with the boundary=frame expected by
+ * the frame reader below. On success, ownership of the socket passes to the caller.
+ */
 static int start_esp32_stream(const char *host, const char *port)
 {
     int sockfd = connect_to_server(host, port);
@@ -207,14 +241,14 @@ static int start_esp32_stream(const char *host, const char *port)
         return -1;
     }
 
-    int request_len = snprintf(
-        request, sizeof(request),
-        "GET /stream HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Accept: multipart/x-mixed-replace\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n",
-        host);
+    /* Build the HTTP/1.1 request and ensure snprintf did not truncate it. */
+    int request_len = snprintf(request, sizeof(request),
+                               "GET /stream HTTP/1.1\r\n"
+                               "Host: %s\r\n"
+                               "Accept: multipart/x-mixed-replace\r\n"
+                               "Connection: keep-alive\r\n"
+                               "\r\n",
+                               host);
 
     if (request_len < 0 || (size_t)request_len >= sizeof(request) ||
         send_all(sockfd, request, (size_t)request_len) != 0)
@@ -224,6 +258,11 @@ static int start_esp32_stream(const char *host, const char *port)
         return -1;
     }
 
+    /*
+     * Read header lines until the blank line separating headers from the body.
+     * Validate the status line and Content-Type independently; ignore other
+     * headers that are not needed by this gateway.
+     */
     while (running)
     {
         int len = read_line(sockfd, line, sizeof(line));
@@ -254,6 +293,7 @@ static int start_esp32_stream(const char *host, const char *port)
         }
     }
 
+    /* Do not start the gateway unless the ESP32-CAM confirms the expected format. */
     if (status_code != 200 || !have_mjpeg_type)
     {
         fprintf(stderr,
@@ -267,7 +307,11 @@ static int start_esp32_stream(const char *host, const char *port)
     return sockfd;
 }
 
-/* Create the local HTTP listening socket for browser connections. */
+/*
+ * Create an HTTP listening socket on web_port. AI_PASSIVE with a NULL host
+ * allows binding to suitable network interfaces; SO_REUSEADDR makes it easier
+ * to restart the server shortly after a previous process has exited.
+ */
 static int create_http_server(const char *port)
 {
     struct addrinfo hints;
@@ -308,6 +352,11 @@ static int create_http_server(const char *port)
     return listenfd;
 }
 
+/*
+ * Read the browser's HTTP request through the end of its headers (CRLF CRLF).
+ * The buffer is limited to REQUEST_SIZE, so oversized requests and connection
+ * errors are rejected rather than being allowed to overflow memory.
+ */
 static int read_http_request(int clientfd, char *request, size_t capacity)
 {
     size_t used = 0;
@@ -336,6 +385,12 @@ static int read_http_request(int clientfd, char *request, size_t capacity)
     return -1;
 }
 
+/*
+ * Serve a static HTML page at the root path. Its img element loads /stream
+ * separately, allowing the browser to display the JPEG parts of the MJPEG
+ * response as video. Compute Content-Length from the page array, excluding
+ * its terminating NUL byte.
+ */
 static void send_http_page(int clientfd)
 {
     static const char page[] =
@@ -375,22 +430,28 @@ static void send_http_page(int clientfd)
     }
 }
 
+/* Return a minimal 404 response for unsupported methods or paths. */
 static void send_http_not_found(int clientfd)
 {
-    static const char response[] =
-        "HTTP/1.1 404 Not Found\r\n"
-        "Content-Length: 0\r\n"
-        "Connection: close\r\n\r\n";
+    static const char response[] = "HTTP/1.1 404 Not Found\r\n"
+                                   "Content-Length: 0\r\n"
+                                   "Connection: close\r\n\r\n";
 
     (void)send_all(clientfd, response, sizeof(response) - 1);
 }
 
 /*
- * Forward JPEG frames from the ESP32-CAM to one browser connection.
- * No frame is written to the filesystem.
+ * Forward the MJPEG stream from the ESP32-CAM to one browser.
+ * For each frame, read the multipart boundary and part headers, validate
+ * Content-Length and Content-Type, receive the complete JPEG payload, and
+ * send the part header and payload to the browser. Frames are held temporarily
+ * on the heap and are never written to disk.
+ * Clients are handled sequentially; when the browser disconnects, return so
+ * the main loop can accept the next request.
  */
 static int stream_to_browser(int espfd, int browserfd)
 {
+    /* Use a multipart response so the browser can receive a continuous sequence of images. */
     static const char response_header[] =
         "HTTP/1.1 200 OK\r\n"
         "Connection: close\r\n"
@@ -403,12 +464,16 @@ static int stream_to_browser(int espfd, int browserfd)
     char line[LINE_SIZE];
     unsigned int frame_count = 0;
 
-    if (send_all(browserfd, response_header,
-                 sizeof(response_header) - 1) != 0)
+    if (send_all(browserfd, response_header, sizeof(response_header) - 1) != 0)
         return -1;
 
     printf("Browser connected: streaming started\n");
 
+    /*
+     * Each frame starts with its own boundary. Accept the closing boundary
+     * as the end of the stream; any other boundary indicates malformed data
+     * and could otherwise desynchronize payload parsing.
+     */
     while (running)
     {
         int len = read_line(espfd, line, sizeof(line));
@@ -428,6 +493,11 @@ static int stream_to_browser(int espfd, int browserfd)
         int have_length = 0;
         int valid_frame_type = 0;
 
+        /*
+         * Read a multipart part's headers through the blank line. Require both
+         * a valid Content-Length and Content-Type image/jpeg before reading
+         * the body.
+         */
         while (running)
         {
             len = read_line(espfd, line, sizeof(line));
@@ -462,6 +532,7 @@ static int stream_to_browser(int espfd, int browserfd)
             return -1;
         }
 
+        /* Allocate the validated payload size; free the memory after sending. */
         unsigned char *jpeg = malloc(content_length);
         if (jpeg == NULL)
         {
@@ -476,14 +547,18 @@ static int stream_to_browser(int espfd, int browserfd)
             return -1;
         }
 
+        /*
+         * Send the multipart header and complete JPEG payload. All three send
+         * operations must succeed for the frame to count as forwarded. Always
+         * free the allocated memory, including when the browser disconnects.
+         */
         char part_header[256];
-        int header_len = snprintf(
-            part_header, sizeof(part_header),
-            "--frame\r\n"
-            "Content-Type: image/jpeg\r\n"
-            "Content-Length: %zu\r\n"
-            "\r\n",
-            content_length);
+        int header_len = snprintf(part_header, sizeof(part_header),
+                                  "--frame\r\n"
+                                  "Content-Type: image/jpeg\r\n"
+                                  "Content-Length: %zu\r\n"
+                                  "\r\n",
+                                  content_length);
 
         int send_result = -1;
 
@@ -507,7 +582,11 @@ static int stream_to_browser(int espfd, int browserfd)
         if (frame_count % 100 == 0)
             printf("Forwarded %u frames\n", frame_count);
 
-        /* Consume CRLF following the JPEG payload in the ESP32-CAM stream. */
+        /*
+         * The input format requires a CRLF after the JPEG payload and before
+         * the next boundary. Consume this blank line to keep the reader
+         * synchronized with the next frame.
+         */
         len = read_line(espfd, line, sizeof(line));
         if (len != 0)
         {
@@ -522,6 +601,7 @@ static int stream_to_browser(int espfd, int browserfd)
 
 int main(int argc, char *argv[])
 {
+    /* The ESP32-CAM host and port are required; the web port is optional. */
     if (argc < 3 || argc > 4)
     {
         fprintf(stderr,
@@ -531,18 +611,26 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    /* Read command-line configuration before setting up signal handlers and sockets. */
     const char *esp32_host = argv[1];
     const char *esp32_port = argv[2];
     const char *web_port = (argc == 4) ? argv[3] : DEFAULT_WEB_PORT;
 
+    /*
+     * SIGINT/SIGTERM request an orderly shutdown of the loops.
+     * Ignore SIGPIPE so send() reports failure through its return value
+     * instead of terminating the process when a client closes its socket.
+     */
     signal(SIGINT, handle_sigint);
     signal(SIGTERM, handle_sigint);
     signal(SIGPIPE, SIG_IGN);
 
+    /* Connect to the MJPEG source first; without it, the gateway cannot serve video. */
     int espfd = start_esp32_stream(esp32_host, esp32_port);
     if (espfd < 0)
         return EXIT_FAILURE;
 
+    /* Open the web port only after the video source has been validated. */
     int listenfd = create_http_server(web_port);
     if (listenfd < 0)
     {
@@ -555,6 +643,11 @@ int main(int argc, char *argv[])
     printf("Open in Chrome: http://<RASPBERRY_PI_IP>:%s/\n", web_port);
     printf("Press Ctrl+C to stop\n");
 
+    /*
+     * Handle clients sequentially: accept a socket, read one HTTP request,
+     * route by method and path, then close the socket. A /stream request
+     * occupies the loop until the stream ends or the client disconnects.
+     */
     while (running)
     {
         struct sockaddr_storage client_addr;
@@ -573,8 +666,7 @@ int main(int argc, char *argv[])
         }
 
         char request[REQUEST_SIZE];
-        int request_len = read_http_request(clientfd, request,
-                                            sizeof(request));
+        int request_len = read_http_request(clientfd, request, sizeof(request));
 
         if (request_len < 0)
         {
@@ -585,8 +677,8 @@ int main(int argc, char *argv[])
         char method[16] = {0};
         char path[256] = {0};
 
-        if (sscanf(request, "%15s %255s", method, path) != 2 ||
-            strcmp(method, "GET") != 0)
+        /* Only GET is supported; other methods receive a 404 in this implementation. */
+        if (sscanf(request, "%15s %255s", method, path) != 2 || strcmp(method, "GET") != 0)
         {
             send_http_not_found(clientfd);
         }
@@ -606,6 +698,7 @@ int main(int argc, char *argv[])
         close(clientfd);
     }
 
+    /* Close the shared sockets before exiting to release system resources. */
     close(listenfd);
     close(espfd);
 

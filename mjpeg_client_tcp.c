@@ -1,5 +1,14 @@
+/*
+ * Connect to an ESP32-CAM MJPEG endpoint, parse its multipart response, and
+ * save each JPEG frame as a separate file in the specified output directory.
+ * Existing regular files named with the "frame_" prefix are removed before
+ * capture starts.
+ */
+
+/* Enable GNU extensions used by functions such as strcasestr(). */
 #define _GNU_SOURCE
 
+/* Standard C and POSIX headers for I/O, memory, signals, and error handling. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -18,18 +27,26 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 
+/* Network buffer sizes and the maximum accepted JPEG frame size. */
 #define BUFFER_SIZE 4096
 #define LINE_SIZE 1024
 #define MAX_FRAME_SIZE (10U * 1024U * 1024U)
 
+/* Shared shutdown flag updated by the signal handler. */
 static volatile sig_atomic_t running = 1;
 
+/* Stop the receive loop cleanly when the user interrupts the program. */
 static void handle_sigint(int signo)
 {
     (void)signo;
     running = 0;
 }
 
+/*
+ * Send every byte of an HTTP request, retrying interrupted calls and
+ * continuing after partial writes. Return -1 if sending fails or the peer
+ * closes the connection before the complete request is transmitted.
+ */
 static int send_all(int sockfd, const char *data, size_t length)
 {
     size_t total = 0;
@@ -55,8 +72,10 @@ static int send_all(int sockfd, const char *data, size_t length)
 }
 
 /*
- * Read exactly one CRLF-terminated line from the TCP socket.
- * The returned string does not contain CRLF.
+ * Read one CRLF-terminated protocol line from the TCP socket.
+ * The returned, null-terminated string excludes CRLF. Return the line length,
+ * or -1 if the connection closes, an error occurs, or the line exceeds the
+ * supplied buffer capacity.
  */
 static int read_line(int sockfd, char *buffer, size_t capacity)
 {
@@ -93,10 +112,14 @@ static int read_line(int sockfd, char *buffer, size_t capacity)
     }
 
     buffer[pos] = '\0';
-    return -1; /* Line too long */
+    return -1; /* The line did not fit in the provided buffer. */
 }
 
-/* Read exactly length bytes from TCP and write them to a file. */
+/*
+ * Receive exactly length bytes from the socket and write them to the open
+ * output file. Use a fixed-size temporary buffer so large frames do not need
+ * to be allocated all at once; return -1 on an incomplete read or file error.
+ */
 static int receive_frame(int sockfd, FILE *fp, size_t length)
 {
     unsigned char buffer[BUFFER_SIZE];
@@ -111,7 +134,8 @@ static int receive_frame(int sockfd, FILE *fp, size_t length)
         ssize_t received = recv(sockfd, buffer, wanted, 0);
 
         if (received == 0)
-            return -1; /* Connection closed before frame completed */
+            /* The peer closed the connection before the frame was complete. */
+            return -1;
 
         if (received < 0)
         {
@@ -134,7 +158,11 @@ static int receive_frame(int sockfd, FILE *fp, size_t length)
     return remaining == 0 ? 0 : -1;
 }
 
-/* Parse Content-Length safely. */
+/*
+ * Parse the decimal value after the colon in a frame's Content-Length header.
+ * Reject empty, malformed, zero, or oversized values before using the length
+ * to determine how many bytes to receive and save.
+ */
 static int parse_content_length(const char *line, size_t *length)
 {
     const char *colon = strchr(line, ':');
@@ -160,28 +188,27 @@ static int parse_content_length(const char *line, size_t *length)
     return 0;
 }
 
-/* Thiết lập kết nối TCP
- * Nếu thành công, hàm trả về socket file descriptor.
- * Nếu thất bại, trả về -1.
+/*
+ * Resolve the server host and port, then try each returned address until a
+ * TCP connection succeeds. Return the connected socket descriptor, or -1
+ * if name resolution fails or no candidate address can be connected to.
  */
 static int connect_to_server(const char *host, const char *port)
 {
-    /* Các biến này phục vụ DNS resolution và duyệt các địa chỉ IP
-     * mà getaddrinfo() trả về.
-     */
+    /*Structures used to resolve the host and iterate through candidate addresses.*/
     struct addrinfo hints;
     struct addrinfo *result = NULL;
     struct addrinfo *rp;
     int sockfd = -1;
 
-    /* set all to 0 */
+    /* Clear optional address-resolution settings before configuring them. */
     memset(&hints, 0, sizeof(hints));
-    /* cho phép sử dụng IPv4 hoặc IPv6. */
+    /* Allow either IPv4 or IPv6 addresses. */
     hints.ai_family = AF_UNSPEC;
-    /* TCP */
+    /* Request a stream socket, which uses TCP. */
     hints.ai_socktype = SOCK_STREAM;
 
-    /* Resolve hostname */
+    /* Resolve the host name and service port into candidate socket addresses. */
     int ret = getaddrinfo(host, port, &hints, &result);
 
     if (ret != 0)
@@ -190,7 +217,7 @@ static int connect_to_server(const char *host, const char *port)
         return -1;
     }
 
-    /* Create TCP connection */
+    /* Try each resolved address until a socket connects successfully. */
     for (rp = result; rp != NULL; rp = rp->ai_next)
     {
         sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
@@ -199,9 +226,10 @@ static int connect_to_server(const char *host, const char *port)
             continue;
 
         if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) == 0)
-            /* nếu kết nối thành công thì thoát */
+            /* Keep this connected socket and stop searching the address list. */
             break;
 
+        /* Discard the failed socket before trying the next candidate address. */
         close(sockfd);
         sockfd = -1;
     }
@@ -211,8 +239,10 @@ static int connect_to_server(const char *host, const char *port)
 }
 
 /*
- * Delete old frame files from the output directory.
- * Only regular files whose names start with "frame_" are deleted.
+ * Remove stale regular files whose names start with "frame_" from the output
+ * directory. lstat() is used so symbolic links are not followed, and only
+ * regular files are unlinked; directories and symlinks are left untouched.
+ * Return -1 if the directory cannot be opened, otherwise return 0 after the scan.
  */
 static int cleanup_frame_files(const char *output_dir)
 {
@@ -231,10 +261,11 @@ static int cleanup_frame_files(const char *output_dir)
     while ((entry = readdir(dir)) != NULL)
     {
 
-        /* Only process files starting with "frame_". */
+        /* Ignore directory entries that do not use the frame-file prefix. */
         if (strncmp(entry->d_name, "frame_", 6) != 0)
             continue;
 
+        /* Construct and bounds-check the full path before using filesystem calls. */
         int len = snprintf(filepath, sizeof(filepath), "%s/%s",
                            output_dir, entry->d_name);
 
@@ -252,14 +283,14 @@ static int cleanup_frame_files(const char *output_dir)
             continue;
         }
 
-        /* Do not delete directories or symbolic links. */
+        /* Do not remove directories, symbolic links, or other non-regular entries. */
         if (!S_ISREG(st.st_mode))
             continue;
 
         if (unlink(filepath) == 0)
         {
             deleted_count++;
-            // printf("Deleted: %s\n", filepath);
+            /* printf("Deleted: %s\n", filepath); */
         }
         else
         {
@@ -274,14 +305,16 @@ static int cleanup_frame_files(const char *output_dir)
     return 0;
 }
 
-/* Tham số	        Ý nghĩa	                            Ví dụ
- * argv[0]	    Tên chương trình	                ./mjpeg_client
- * argv[1]	    IP hoặc hostname của ESP32-CAM	    192.168.1.100
- * argv[2]	    TCP port	                        81
- * argv[3]	    Thư mục lưu ảnh	                    /mnt/usb/frames
+/*
+ * Command-line arguments:
+ * argv[0] - program name
+ * argv[1] - ESP32-CAM host name or IP address
+ * argv[2] - camera TCP port
+ * argv[3] - directory in which JPEG frames are saved
  */
 int main(int argc, char *argv[])
 {
+    /* Require the camera host, port, and destination directory. */
     if (argc != 4)
     {
         fprintf(stderr,
@@ -291,11 +324,15 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    /* Keep the caller-provided connection and output settings. */
     const char *host = argv[1];
     const char *port = argv[2];
     const char *output_dir = argv[3];
 
-    /* Remove old frame files before starting. */
+    /*
+     * Remove previous frame captures first so the output directory contains
+     * only files produced by this run. Other files are left untouched.
+     */
     printf("Cleaning old frame files...\n");
 
     if (cleanup_frame_files(output_dir) != 0)
@@ -304,10 +341,10 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    /* Đăng ký xử lý tín hiệu SIGINT */
+    /* Let Ctrl+C request a clean exit from the capture loop. */
     signal(SIGINT, handle_sigint);
 
-    /* Thiết lập kết nối TCP */
+    /* Establish the TCP connection to the camera before sending the request. */
     int sockfd = connect_to_server(host, port);
 
     if (sockfd < 0)
@@ -318,11 +355,10 @@ int main(int argc, char *argv[])
 
     printf("TCP connection established\n");
 
-    /* Tạo HTTP GET request:
-     * GET /stream HTTP/1.1
-     * Host: 192.168.1.100
-     * Accept: multipart/x-mixed-replace
-     * Connection: keep-alive
+    /*
+     * Build the HTTP/1.1 request for the camera's /stream endpoint.
+     * Accept advertises that this client expects a multipart MJPEG response;
+     * keep-alive keeps the TCP connection open while frames are streamed.
      */
     char request[1024];
 
@@ -334,6 +370,7 @@ int main(int argc, char *argv[])
                                "\r\n",
                                host);
 
+    /* Verify that the complete request fits in the fixed-size request buffer. */
     if (request_len < 0 || (size_t)request_len >= sizeof(request))
     {
         fprintf(stderr, "HTTP request is too long\n");
@@ -341,7 +378,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    /* gửi toàn bộ request qua TCP socket. */
+    /* Send the complete request, including handling any partial socket writes. */
     if (send_all(sockfd, request, (size_t)request_len) != 0)
     {
         perror("send_all");
@@ -351,14 +388,18 @@ int main(int argc, char *argv[])
 
     printf("HTTP GET request sent\n");
 
-    /* Read HTTP response headers. */
+    /*
+     * Read the response headers line by line until the blank line separating
+     * the HTTP headers from the multipart body. Track the status and confirm
+     * that the server uses the boundary expected by the frame parser.
+     */
     char line[LINE_SIZE];
     int status_code = 0;
     int have_content_type = 0;
 
     while (running)
     {
-        /* Client bắt đầu đọc HTTP response headers bằng read_line(). */
+        /* Read the next response-header line from the camera. */
         int len = read_line(sockfd, line, sizeof(line));
 
         if (len < 0)
@@ -371,10 +412,9 @@ int main(int argc, char *argv[])
         if (len == 0)
             break;
 
-        /* Ví dụ server trả về:
-         * HTTP/1.1 200 OK
-         * Content-Type: multipart/x-mixed-replace; boundary=frame
-         * Connection: keep-alive
+        /*
+         * Parse the status line and Content-Type. Other response headers are
+         * not needed by this client and are ignored.
          */
         if (strncmp(line, "HTTP/", 5) == 0)
         {
@@ -397,6 +437,7 @@ int main(int argc, char *argv[])
 
     printf("HTTP Status: %d\n", status_code);
 
+    /* Do not attempt to parse frames unless the response matches expectations. */
     if (status_code != 200 || !have_content_type)
     {
         fprintf(stderr, "Unexpected HTTP response or multipart boundary\n");
@@ -406,12 +447,15 @@ int main(int argc, char *argv[])
 
     printf("MJPEG multipart response accepted\n");
 
-    /* Receive multipart frames. */
+    /*
+     * Parse each multipart section and save its JPEG payload as a separate
+     * sequentially numbered file in the output directory.
+     */
     unsigned int frame_count = 0;
 
     while (running)
     {
-        /* Find the next frame boundary. */
+        /* Each JPEG part must begin with the expected multipart boundary. */
         int len = read_line(sockfd, line, sizeof(line));
 
         if (len < 0)
@@ -426,7 +470,11 @@ int main(int argc, char *argv[])
             break;
         }
 
-        /* Read headers belonging to this JPEG frame. */
+        /*
+         * Read this part's headers through the blank line before the payload.
+         * Both a valid Content-Length and an image/jpeg Content-Type are
+         * required to safely identify and receive the frame body.
+         */
         size_t content_length = 0;
         int have_length = 0;
         int valid_frame_type = 0;
@@ -464,6 +512,7 @@ int main(int argc, char *argv[])
             break;
         }
 
+        /* Build the next output name and reject paths that exceed the buffer. */
         char filename[PATH_MAX];
 
         int name_len = snprintf(filename, sizeof(filename),
@@ -476,6 +525,7 @@ int main(int argc, char *argv[])
             break;
         }
 
+        /* Open each frame in binary mode so JPEG bytes are preserved exactly. */
         FILE *fp = fopen(filename, "wb");
 
         if (fp == NULL)
@@ -484,6 +534,7 @@ int main(int argc, char *argv[])
             break;
         }
 
+        /* Receive exactly the declared payload length, writing it to this file. */
         int receive_result = receive_frame(sockfd, fp, content_length);
 
         if (fclose(fp) != 0)
@@ -492,6 +543,7 @@ int main(int argc, char *argv[])
             receive_result = -1;
         }
 
+        /* Do not keep a partially received image if the stream or file write fails. */
         if (receive_result != 0)
         {
             fprintf(stderr, "Incomplete frame; removing %s\n", filename);
@@ -504,7 +556,7 @@ int main(int argc, char *argv[])
         printf("Frame %06u received: %zu bytes -> %s\n",
                frame_count, content_length, filename);
 
-        /* Consume the CRLF after the binary JPEG frame. */
+        /* Consume the CRLF separator following the binary JPEG payload. */
         len = read_line(sockfd, line, sizeof(line));
 
         if (len != 0)
@@ -514,6 +566,7 @@ int main(int argc, char *argv[])
         }
     }
 
+    /* Close the camera socket after normal completion, protocol error, or interrupt. */
     close(sockfd);
 
     printf("\nMJPEG client stopped\n");
