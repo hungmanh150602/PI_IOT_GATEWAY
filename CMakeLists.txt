@@ -33,6 +33,11 @@ add_executable(stream_video_tcp_hdmi
     src/stream_video_tcp_hdmi.c
 )
 
+# MJPEG udp for Chrome browser
+add_executable(stream_video_udp_web
+    src/stream_video_udp_web.c
+)
+
 # Compiler warnings
 foreach(target
     main
@@ -40,6 +45,7 @@ foreach(target
     mjpeg_client_tcp
     stream_video_tcp_web
     stream_video_tcp_hdmi
+    stream_video_udp_web
 )
     target_compile_options(${target} PRIVATE
         -Wall

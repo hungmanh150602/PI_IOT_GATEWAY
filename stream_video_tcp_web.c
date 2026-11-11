@@ -625,7 +625,9 @@ int main(int argc, char *argv[])
     signal(SIGTERM, handle_sigint);
     signal(SIGPIPE, SIG_IGN);
 
-    /* Connect to the MJPEG source first; without it, the gateway cannot serve video. */
+    /* Connect to the MJPEG source first;
+     * without it, the gateway cannot serve video.
+     */
     int espfd = start_esp32_stream(esp32_host, esp32_port);
     if (espfd < 0)
         return EXIT_FAILURE;
