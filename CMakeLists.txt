@@ -38,6 +38,11 @@ add_executable(stream_video_udp_web
     src/stream_video_udp_web.c
 )
 
+# test_api_request
+add_executable(test_api_request
+    src/test_api_request.c
+)
+
 # Compiler warnings
 foreach(target
     main
@@ -46,6 +51,7 @@ foreach(target
     stream_video_tcp_web
     stream_video_tcp_hdmi
     stream_video_udp_web
+    test_api_request
 )
     target_compile_options(${target} PRIVATE
         -Wall
